@@ -697,7 +697,12 @@ def reapply_tool_filters(servers: dict[str, dict]) -> int:
             desired = {candidate.registry_name: candidate for candidate in candidates}
             native_names = {_schema._convert_mcp_schema(name, tool)["name"]
                             for tool in server._tools}
-            managed = native_names | {item.registry_name for item in utility}
+            # Manage every possible generated utility name, not just utilities
+            # still enabled by the NEW config. Disabling resources/prompts/events
+            # must revoke handlers registered by the previous configuration.
+            managed = native_names | {
+                item["schema"]["name"] for item in _build_utility_schemas(name)
+            }
             # Only mutate registrations owned by THIS profile, never a global
             # fallback or another profile's same-named server.
             current_entries = {
