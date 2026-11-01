@@ -580,3 +580,42 @@ def test_live_filter_change_only_mutates_the_adopting_profile(two_profiles):
     two_profiles("a")
     assert registry.get_tool_names_for_toolset("mcp-x") == ["mcp__x__t"]
     assert registry.snapshot_registration("mcp__x__t2", scope=a) is None
+
+
+def test_live_filter_replaces_native_handler_on_identical_schema_utility_collision(two_profiles):
+    """Revoking a native tool must swap its handler even when wire schemas match."""
+    from tools import mcp_tool_discovery as disc, mcp_tool_registration as reg
+    from tools.registry import registry
+
+    cfg = {"url": "https://mcp.example/x", "tools": {"include": ["read_resource"]}}
+    two_profiles("a")
+    server = _server("x", cfg)
+    server.session = SimpleNamespace(read_resource=lambda *_a, **_k: None)
+    utility_schema = next(
+        item["schema"] for item in reg._select_utility_schemas("x", server, cfg)
+        if item["handler_key"] == "read_resource"
+    )
+    server._tools = [SimpleNamespace(
+        name="read_resource", description=utility_schema["description"],
+        inputSchema=utility_schema["parameters"], annotations=None,
+    )]
+    disc._adopt_server("x", server)
+    server._registered_tool_names = reg._register_server_tools("x", server, cfg)
+    tool_name = "mcp__x__read_resource"
+    first = registry.snapshot_registration(tool_name, scope=reg._core._mcp_registry_scope())
+    assert first is not None
+    assert first.schema == utility_schema  # Same exposed schema, different dispatch handler.
+
+    utility_only = {**cfg, "tools": {"include": []}}
+    assert reg.reapply_tool_filters({"x": utility_only}) == 1
+    second = registry.snapshot_registration(tool_name, scope=reg._core._mcp_registry_scope())
+    assert second is not None
+    assert second.schema == first.schema
+    assert second.handler is not first.handler  # The revoked native handler must not survive.
+    assert reg.reapply_tool_filters({"x": utility_only}) == 0
+
+    assert reg.reapply_tool_filters({"x": cfg}) == 1
+    third = registry.snapshot_registration(tool_name, scope=reg._core._mcp_registry_scope())
+    assert third is not None
+    assert third.handler is not second.handler
+    assert third.schema == first.schema
