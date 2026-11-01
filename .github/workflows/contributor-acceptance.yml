@@ -55,17 +55,25 @@ jobs:
       - name: Run changed-area regressions through the canonical runner
         shell: bash
         run: |
-          scripts/run_tests.sh -j 4 \
-            tests/tools/test_mcp_reconcile_with_config.py \
-            tests/tools/test_mcp_tool.py \
-            tests/tools/test_mcp_dynamic_discovery.py \
-            tests/tools/test_mcp_multiplex_connection_keys.py \
-            tests/tools/test_mcp_schema_cache.py \
-            tests/tools/test_mcp_lazy_start.py \
-            tests/tools/test_mcp_live_filter_reconcile.py \
-            tests/tools/test_mcp_config_change_rebind.py \
-            tests/gateway/test_mcp_reload_held_revision.py \
+          # This workflow is also tested on the fork's baseline branch,
+          # before the proposed bugfix (and its new regression) is present.
+          tests=(
+            tests/tools/test_mcp_reconcile_with_config.py
+            tests/tools/test_mcp_tool.py
+            tests/tools/test_mcp_dynamic_discovery.py
+            tests/tools/test_mcp_multiplex_connection_keys.py
+            tests/tools/test_mcp_schema_cache.py
+            tests/tools/test_mcp_lazy_start.py
+            tests/tools/test_mcp_config_change_rebind.py
+            tests/gateway/test_mcp_reload_held_revision.py
             tests/gateway/test_mcp_reload_new_server.py
+          )
+          if [[ -f tests/tools/test_mcp_live_filter_reconcile.py ]]; then
+            tests+=(tests/tools/test_mcp_live_filter_reconcile.py)
+          else
+            echo 'Patch-only MCP live-filter test not present on this branch'
+          fi
+          scripts/run_tests.sh -j 4 "${tests[@]}"
 
   full-suite-linux:
     name: Canonical full suite Linux (${{ matrix.slice }}/2)
