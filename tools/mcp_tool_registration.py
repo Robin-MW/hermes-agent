@@ -631,6 +631,19 @@ def _register_connected_into_current_scope(servers: dict) -> int:
 
 
 
+def _same_handler_factory_code(existing, desired: _Candidate) -> bool:
+    """Wire schema equality does not prove identical dispatch semantics.
+
+    A filtered server-native read_resource can have the exact same JSON schema
+    and description as the generated resource utility, while the handlers are
+    different. Python closure factories produce fresh handler objects on every
+    scan, so compare their immutable code objects instead of object identity.
+    An unknown non-function handler is conservatively treated as changed.
+    """
+    existing_code = getattr(existing.handler, "__code__", None)
+    return existing_code is not None and existing_code is getattr(desired.handler, "__code__", None)
+
+
 def reapply_tool_filters(servers: dict[str, dict]) -> int:
     """Reconcile live MCP *native* tools against this profile's current filters.
 
@@ -695,7 +708,8 @@ def reapply_tool_filters(servers: dict[str, dict]) -> int:
             remove = sorted(
                 tool_name for tool_name in current_entries.keys() & managed
                 if (tool_name not in desired
-                    or current_entries[tool_name].schema != desired[tool_name].schema)
+                    or current_entries[tool_name].schema != desired[tool_name].schema
+                    or not _same_handler_factory_code(current_entries[tool_name], desired[tool_name]))
             )
             missing = desired.keys() - current_entries.keys()
             if not remove and not missing:
