@@ -1,0 +1,116 @@
+name: Contributor acceptance (fork only)
+
+# Fork-only acceptance; never publishes or accesses secrets.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contributor-acceptance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: Blocking checks (Linux)
+    if: github.repository == 'Robin-MW/hermes-agent' && (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == 'Robin-MW/hermes-agent')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up locked Hermes test toolchain
+        uses: ./.github/actions/setup-pm
+        with:
+          test-environment: 'true'
+          cache: 'false'
+      - name: Run blocking lint and health checks
+        shell: bash
+        run: scripts/run-in-hermes-env python scripts/check
+
+  affected:
+    name: MCP and gateway (${{ matrix.os }})
+    if: github.repository == 'Robin-MW/hermes-agent' && (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == 'Robin-MW/hermes-agent')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up locked Hermes test toolchain
+        uses: ./.github/actions/setup-pm
+        with:
+          test-environment: 'true'
+          cache: 'false'
+      - name: Run changed-area regressions through the canonical runner
+        shell: bash
+        run: |
+          scripts/run_tests.sh -j 4 \
+            tests/tools/test_mcp_reconcile_with_config.py \
+            tests/tools/test_mcp_tool.py \
+            tests/tools/test_mcp_dynamic_discovery.py \
+            tests/tools/test_mcp_multiplex_connection_keys.py \
+            tests/tools/test_mcp_schema_cache.py \
+            tests/tools/test_mcp_lazy_start.py \
+            tests/tools/test_mcp_live_filter_reconcile.py \
+            tests/tools/test_mcp_config_change_rebind.py \
+            tests/gateway/test_mcp_reload_held_revision.py \
+            tests/gateway/test_mcp_reload_new_server.py
+
+  full-suite-linux:
+    name: Canonical full suite Linux (${{ matrix.slice }}/2)
+    if: github.repository == 'Robin-MW/hermes-agent' && (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == 'Robin-MW/hermes-agent')
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up locked Hermes test toolchain
+        uses: ./.github/actions/setup-pm
+        with:
+          test-environment: 'true'
+          cache: 'false'
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "keychain"]'
+      - name: Run full suite through upstream canonical runner
+        shell: bash
+        env:
+          HERMES_TEST_SLICE: ${{ matrix.slice }}/2
+          HERMES_TEST_WORKERS: '4'
+          HERMES_TEST_FILE_TIMEOUT: '600'
+          HERMES_TEST_FILE_RETRIES: '0'
+        run: scripts/run_tests.sh -j 4
+
+  acceptance:
+    name: Contributor acceptance gate
+    if: always() && github.repository == 'Robin-MW/hermes-agent'
+    needs: [static, affected, full-suite-linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every lane to succeed
+        env:
+          STATIC: ${{ needs.static.result }}
+          AFFECTED: ${{ needs.affected.result }}
+          FULL: ${{ needs.full-suite-linux.result }}
+        run: |
+          set -euo pipefail
+          printf 'static=%s affected=%s full=%s\n' "$STATIC" "$AFFECTED" "$FULL"
+          test "$STATIC" = success
+          test "$AFFECTED" = success
+          test "$FULL" = success
