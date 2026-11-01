@@ -619,3 +619,34 @@ def test_live_filter_replaces_native_handler_on_identical_schema_utility_collisi
     assert third is not None
     assert third.handler is not second.handler
     assert third.schema == first.schema
+
+
+def test_live_filter_revokes_disabled_generated_resource_utilities(two_profiles):
+    """Turning off tools.resources removes existing generated utility handlers."""
+    from tools import mcp_tool_discovery as disc, mcp_tool_registration as reg
+    from tools.registry import registry
+
+    cfg = {
+        "url": "https://mcp.example/x",
+        "tools": {"include": [], "resources": True, "prompts": False},
+    }
+    scope = two_profiles("a")
+    server = _server("x", cfg)
+    server.session = SimpleNamespace(
+        read_resource=lambda *_a, **_k: None,
+        list_resources=lambda *_a, **_k: None,
+    )
+    disc._adopt_server("x", server)
+    server._registered_tool_names = reg._register_server_tools("x", server, cfg)
+    names = ("mcp__x__read_resource", "mcp__x__list_resources")
+    for name in names:
+        assert registry.snapshot_registration(name, scope=scope) is not None
+
+    disabled = {**cfg, "tools": {**cfg["tools"], "resources": False}}
+    assert reg.reapply_tool_filters({"x": disabled}) == 1
+    for name in names:
+        assert registry.snapshot_registration(name, scope=scope) is None
+    assert reg.reapply_tool_filters({"x": disabled}) == 0
+    assert reg.reapply_tool_filters({"x": cfg}) == 1
+    for name in names:
+        assert registry.snapshot_registration(name, scope=scope) is not None
