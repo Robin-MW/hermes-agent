@@ -95,16 +95,11 @@ jobs:
           test-environment: 'true'
           cache: 'false'
           extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "keychain"]'
-      # Search and PM-store tests expect the external rg binary on PATH.
-      # Pin the distro package to the hosted Ubuntu image and fail before
-      # the expensive suite if the dependency is missing.
-      - name: Install Linux test system dependency (ripgrep)
+          # PM resolves the version and checks SHA256 against pm/lock.json.
+          packages: ripgrep
+      - name: Verify locked ripgrep is on PATH
         shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ripgrep
-          rg --version
+        run: rg --version
       - name: Run full suite through upstream canonical runner
         shell: bash
         env:
