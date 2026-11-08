@@ -470,7 +470,10 @@ def _connection_identity(config: dict) -> tuple:
     def _frozen(value):
         return json.dumps(value or {}, sort_keys=True, default=str)
 
-    return (config_fingerprint(config), _frozen(config.get("env")), _frozen(config.get("headers")),
+    # Tool selection is a per-profile registration policy, not a connection route.
+    # Keep the schema-cache fingerprint filter-sensitive; only drop filters here.
+    route = {k: v for k, v in config.items() if k != "tools"}
+    return (config_fingerprint(route), _frozen(config.get("env")), _frozen(config.get("headers")),
             _auth_type(config), _frozen(config.get("client_cert")), _frozen(config.get("client_key")),
             config.get("ssl_verify", True), bool(config.get("strict_redirect_headers")))
 
@@ -625,6 +628,130 @@ def _register_connected_into_current_scope(servers: dict) -> int:
                 server._registered_tool_names = sorted(
                     set(getattr(server, "_registered_tool_names", []) or ()) | set(names))
     return registered_servers
+
+
+
+def _same_handler_factory_code(existing, desired: _Candidate) -> bool:
+    """Wire schema equality does not prove identical dispatch semantics.
+
+    A filtered server-native read_resource can have the exact same JSON schema
+    and description as the generated resource utility, while the handlers are
+    different. Python closure factories produce fresh handler objects on every
+    scan, so compare their immutable code objects instead of object identity.
+    An unknown non-function handler is conservatively treated as changed.
+    """
+    existing_code = getattr(existing.handler, "__code__", None)
+    return existing_code is not None and existing_code is getattr(desired.handler, "__code__", None)
+
+
+def reapply_tool_filters(servers: dict[str, dict]) -> int:
+    """Reconcile live MCP *native* tools against this profile's current filters.
+
+    Preserve generated resource/prompt/event utilities according to their own
+    enablement and native-tool collision rules. Never restart a connection or
+    modify an editor's frozen MCP manifest. Both discovery and dispatch use
+    the registry's current per-profile overlay.
+    """
+    from tools.registry import registry
+
+    scope = _core._mcp_registry_scope()
+    if (scope or "").startswith("editor-session:"):
+        return 0
+
+    changed = 0
+    with _SCOPE_REFRESH_LOCKS[hash(scope) % len(_SCOPE_REFRESH_LOCKS)]:
+        for name, config in servers.items():
+            if not mcp_server_enabled(config):
+                continue
+            with _core._lock:
+                key = _resolve_server_key(name, scope, current=False)
+                server = _core._servers.get(key)
+            # A transport may already be present in the ledger before its native
+            # tool manifest is available. Without that manifest we cannot safely
+            # infer which existing registrations should be revoked or restored.
+            if (server is None or getattr(server, "session", None) is None
+                    or not hasattr(server, "_tools") or not hasattr(server, "tool_timeout")):
+                continue
+
+            borrowed = _key_scope(key) != scope
+            resolved = None
+            if borrowed:
+                from tools.mcp_tool_discovery import _owner_secret_scope
+                with _owner_secret_scope():
+                    resolved = _adopter_identity_digest(name, config)
+            if not _same_server_route(server, config, cross_profile=borrowed,
+                                      resolved_identity=resolved):
+                continue
+
+            # Reuse the SAME native-vs-utility collision policy as initial discovery.
+            # A filtered native "read_resource", for example, must yield to the
+            # generated utility, and it must win again when re-enabled (#87112).
+            # Simply subtracting utility names from native names silently leaves
+            # a disallowed native callable.
+            utility = _utility_candidates(
+                name, _select_utility_schemas(name, server, config), server.tool_timeout)
+            should_register = _make_tool_filter(name, config)
+            candidates = _resolve_name_collisions(
+                name, _tool_candidates(name, server._tools, should_register, server.tool_timeout)
+                + utility)
+            desired = {candidate.registry_name: candidate for candidate in candidates}
+            native_names = {_schema._convert_mcp_schema(name, tool)["name"]
+                            for tool in server._tools}
+            # Manage every possible generated utility name, not just utilities
+            # still enabled by the NEW config. Disabling resources/prompts/events
+            # must revoke handlers registered by the previous configuration.
+            managed = native_names | {
+                item["schema"]["name"] for item in _build_utility_schemas(name)
+            }
+            # Only mutate registrations owned by THIS profile, never a global
+            # fallback or another profile's same-named server.
+            current_entries = {
+                tool_name: entry
+                for tool_name in registry.get_tool_names_for_toolset(f"mcp-{name}")
+                if (entry := registry.snapshot_registration(tool_name, scope=scope)) is not None
+            }
+            remove = sorted(
+                tool_name for tool_name in current_entries.keys() & managed
+                if (tool_name not in desired
+                    or current_entries[tool_name].schema != desired[tool_name].schema
+                    or not _same_handler_factory_code(current_entries[tool_name], desired[tool_name]))
+            )
+            missing = desired.keys() - current_entries.keys()
+            if not remove and not missing:
+                continue
+            additions = [item for item in candidates
+                         if item.registry_name in missing or item.registry_name in remove]
+            with _core._lock:
+                if _core._servers.get(key) is not server:
+                    continue  # connection replaced during the reconciliation
+            for tool_name in remove:
+                registry.deregister(tool_name, scope=scope)
+            added = _register_candidates(
+                name, additions, check_fn=_make_check_fn(name),
+                scope=lambda: scope, lazy=False, key=key,
+                execution_timeout=config.get("timeout"))
+            if not remove and not added:
+                continue
+
+            with _core._lock:
+                serving_scopes = set(_core._server_tool_scopes.get(key, ()))
+            scopes = serving_scopes or {scope}
+            old_names = set(getattr(server, "_registered_tool_names", ()) or ())
+            server._registered_tool_names = sorted(
+                tool_name for tool_name in old_names | set(added)
+                if any(registry.snapshot_registration(tool_name, scope=owner) is not None
+                       for owner in scopes))
+            for tool_name in remove:
+                if not any(registry.snapshot_registration(tool_name, scope=owner) is not None
+                           for owner in scopes):
+                    _forget_mcp_tool_server(tool_name)
+            _restore_server_toolset_alias(key)
+            _write_schema_cache(name, server, config, should_register)
+            logger.info("MCP server '%s': reconciled live tool registrations for this profile "
+                        "(+%d, -%d); existing sessions keep their pinned prompt tool list",
+                        name, len(added), len(remove))
+            changed += 1
+    return changed
 
 
 def _register_from_cache_sync(name: str, config: dict, entry: dict) -> list[str]:

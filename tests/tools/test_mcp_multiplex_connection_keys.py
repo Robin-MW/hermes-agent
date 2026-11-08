@@ -425,3 +425,231 @@ def test_adopter_scope_setup_failure_leaks_no_override_and_continues(two_profile
     assert get_hermes_home_override() is None
     assert ss.current_secret_scope() is None
     assert registered == [{"x": {"url": "https://mcp.example/x"}}]
+
+
+def test_filter_change_preserves_live_connection_and_reconciles_native_tools(two_profiles):
+    """Regression: #145265. Live allowlist edits are not connection changes."""
+    import tools.mcp_tool as core
+    from tools import mcp_tool_discovery as disc, mcp_tool_registration as reg
+    from tools.registry import registry
+
+    cfg = {"url": "https://mcp.example/x",
+           "headers": {"Authorization": "Bearer same"},
+           "tools": {"include": ["t"]}}
+    scope = two_profiles("a")
+    server = _server("x", cfg)
+    server._tools.append(SimpleNamespace(
+        name="t2", description="second", inputSchema={"type": "object", "properties": {}},
+        annotations=None))
+    disc._adopt_server("x", server)
+    server._registered_tool_names = reg._register_server_tools("x", server, cfg)
+    assert registry.get_tool_names_for_toolset("mcp-x") == ["mcp__x__t"]
+
+    expanded = {**cfg, "tools": {"include": ["t", "t2"]}}
+    assert reg._same_server_route(server, expanded)
+    assert reg.reapply_tool_filters({"x": expanded}) == 1
+    assert registry.get_tool_names_for_toolset("mcp-x") == ["mcp__x__t", "mcp__x__t2"]
+    assert reg.reapply_tool_filters({"x": expanded}) == 0
+    assert core._servers[(scope, "x")] is server
+
+    narrowed = {**cfg, "tools": {"include": ["t2"]}}
+    assert reg.reapply_tool_filters({"x": narrowed}) == 1
+    assert registry.get_tool_names_for_toolset("mcp-x") == ["mcp__x__t2"]
+    assert registry.snapshot_registration("mcp__x__t", scope=scope) is None
+    assert reg.reapply_tool_filters({"x": narrowed}) == 0
+    assert core._servers[(scope, "x")] is server
+
+    # Explicitly disabling every native tool must revoke it from the live
+    # registry, and widening the filter later must restore it without a reconnect.
+    none = {**cfg, "tools": {"include": []}}
+    assert reg.reapply_tool_filters({"x": none}) == 1
+    assert registry.get_tool_names_for_toolset("mcp-x") == []
+    assert reg.reapply_tool_filters({"x": none}) == 0
+    assert reg.reapply_tool_filters({"x": cfg}) == 1
+    assert registry.get_tool_names_for_toolset("mcp-x") == ["mcp__x__t"]
+    assert core._servers[(scope, "x")] is server
+
+
+def test_filter_reconcile_never_reuses_other_credentials(two_profiles):
+    """A filter edit must not make a differently authenticated route share tools."""
+    from tools import mcp_tool_discovery as disc, mcp_tool_registration as reg
+    from tools.registry import registry
+
+    cfg_a = {"url": "https://mcp.example/x",
+             "headers": {"Authorization": "Bearer A"},
+             "tools": {"include": ["t"]}}
+    cfg_b = {"url": "https://mcp.example/x",
+             "headers": {"Authorization": "Bearer B"},
+             "tools": {"include": ["t"]}}
+    two_profiles("a")
+    server = _server("x", cfg_a)
+    disc._adopt_server("x", server)
+    server._registered_tool_names = reg._register_server_tools("x", server, cfg_a)
+    two_profiles("b")
+    assert not reg._same_server_route(server, cfg_b)
+    assert reg.reapply_tool_filters({"x": cfg_b}) == 0
+    assert registry.get_tool_names_for_toolset("mcp-x") == []
+
+
+def test_filter_reconcile_defers_until_live_tool_manifest_is_available(two_profiles):
+    """A connected transport without a completed tools/list is not a tool revocation."""
+    import tools.mcp_tool as core
+    from tools import mcp_tool_registration as reg
+
+    scope = two_profiles("a")
+    cfg = {"url": "https://mcp.example/x"}
+    incomplete = SimpleNamespace(
+        session=object(), _config=cfg, _registered_tool_names=[],
+    )
+    with core._lock:
+        core._servers[(scope, "x")] = incomplete
+
+    assert reg.reapply_tool_filters({"x": cfg}) == 0
+    assert core._servers[(scope, "x")] is incomplete
+
+
+def test_filter_reconcile_preserves_native_over_utility_collision(two_profiles):
+    """#87112: changing the allowlist swaps native/utility handlers without reconnect."""
+    from tools import mcp_tool_discovery as disc, mcp_tool_registration as reg
+    from tools.registry import registry
+
+    cfg = {"url": "https://mcp.example/x", "tools": {
+        "include": ["read_resource"], "prompts": False,
+    }}
+    scope = two_profiles("a")
+    srv = _server("x", cfg)
+    srv.session = SimpleNamespace(
+        read_resource=lambda *_a, **_k: None,
+        list_resources=lambda *_a, **_k: None,
+    )
+    srv._tools = [SimpleNamespace(
+        name="read_resource", description="Native read-resource tool",
+        inputSchema={"type": "object", "properties": {}}, annotations=None,
+    )]
+    disc._adopt_server("x", srv)
+    srv._registered_tool_names = reg._register_server_tools("x", srv, cfg)
+    tool = "mcp__x__read_resource"
+    first = registry.snapshot_registration(tool, scope=scope)
+    assert first is not None
+    assert first.description == "Native read-resource tool"
+
+    # Native is excluded, but the resource utility remains enabled.
+    utility_only = {**cfg, "tools": {"include": [], "prompts": False}}
+    assert reg.reapply_tool_filters({"x": utility_only}) == 1
+    second = registry.snapshot_registration(tool, scope=scope)
+    assert second is not None
+    assert second is not first
+    assert second.description != "Native read-resource tool"
+    assert reg.reapply_tool_filters({"x": utility_only}) == 0
+
+    # Re-enable the native tool. It must regain precedence over utility sugar.
+    assert reg.reapply_tool_filters({"x": cfg}) == 1
+    third = registry.snapshot_registration(tool, scope=scope)
+    assert third is not None
+    assert third.description == "Native read-resource tool"
+    assert third is not second
+    assert reg.reapply_tool_filters({"x": cfg}) == 0
+
+
+def test_live_filter_change_only_mutates_the_adopting_profile(two_profiles):
+    """The same live transport may expose different native tools to its profiles."""
+    from tools import mcp_tool_discovery as disc, mcp_tool_registration as reg
+    from tools.registry import registry
+
+    route = {"url": "https://mcp.example/x",
+             "headers": {"Authorization": "Bearer shared"}}
+    a_config = {**route, "tools": {"include": ["t"]}}
+    b_config = {**route, "tools": {"include": ["t2"]}}
+    a = two_profiles("a")
+    server = _server("x", a_config)
+    server._tools.append(SimpleNamespace(
+        name="t2", description="second", inputSchema={"type": "object", "properties": {}},
+        annotations=None,
+    ))
+    disc._adopt_server("x", server)
+    server._registered_tool_names = reg._register_server_tools("x", server, a_config)
+    assert registry.get_tool_names_for_toolset("mcp-x") == ["mcp__x__t"]
+
+    b = two_profiles("b")
+    assert reg.register_connected_into_current_scope({"x": b_config}) == 1
+    assert registry.get_tool_names_for_toolset("mcp-x") == ["mcp__x__t2"]
+    assert registry.snapshot_registration("mcp__x__t", scope=b) is None
+    assert reg.reapply_tool_filters({"x": {**route, "tools": {"include": []}}}) == 1
+    assert registry.get_tool_names_for_toolset("mcp-x") == []
+
+    two_profiles("a")
+    assert registry.get_tool_names_for_toolset("mcp-x") == ["mcp__x__t"]
+    assert registry.snapshot_registration("mcp__x__t2", scope=a) is None
+
+
+def test_live_filter_replaces_native_handler_on_identical_schema_utility_collision(two_profiles):
+    """Revoking a native tool must swap its handler even when wire schemas match."""
+    from tools import mcp_tool_discovery as disc, mcp_tool_registration as reg
+    from tools.registry import registry
+
+    cfg = {"url": "https://mcp.example/x", "tools": {"include": ["read_resource"]}}
+    two_profiles("a")
+    server = _server("x", cfg)
+    server.session = SimpleNamespace(read_resource=lambda *_a, **_k: None)
+    utility_schema = next(
+        item["schema"] for item in reg._select_utility_schemas("x", server, cfg)
+        if item["handler_key"] == "read_resource"
+    )
+    server._tools = [SimpleNamespace(
+        name="read_resource", description=utility_schema["description"],
+        inputSchema=utility_schema["parameters"], annotations=None,
+    )]
+    disc._adopt_server("x", server)
+    server._registered_tool_names = reg._register_server_tools("x", server, cfg)
+    tool_name = "mcp__x__read_resource"
+    first = registry.snapshot_registration(tool_name, scope=reg._core._mcp_registry_scope())
+    assert first is not None
+    assert first.schema == utility_schema  # Same exposed schema, different dispatch handler.
+
+    utility_only = {**cfg, "tools": {"include": []}}
+    assert reg.reapply_tool_filters({"x": utility_only}) == 1
+    second = registry.snapshot_registration(tool_name, scope=reg._core._mcp_registry_scope())
+    assert second is not None
+    assert second.schema == first.schema
+    assert second.handler is not first.handler  # The revoked native handler must not survive.
+    assert reg.reapply_tool_filters({"x": utility_only}) == 0
+
+    assert reg.reapply_tool_filters({"x": cfg}) == 1
+    third = registry.snapshot_registration(tool_name, scope=reg._core._mcp_registry_scope())
+    assert third is not None
+    assert third.handler is not second.handler
+    assert third.schema == first.schema
+
+
+@pytest.mark.parametrize("family,handler_names", [
+    ("resources", ("read_resource", "list_resources")),
+    ("prompts", ("get_prompt", "list_prompts")),
+])
+def test_live_filter_revokes_disabled_generated_utilities(two_profiles, family, handler_names):
+    """Turning off a generated utility family revokes old handlers and allows restoration."""
+    from tools import mcp_tool_discovery as disc, mcp_tool_registration as reg
+    from tools.registry import registry
+
+    cfg = {
+        "url": "https://mcp.example/x",
+        "tools": {"include": [], "resources": family == "resources", "prompts": family == "prompts"},
+    }
+    scope = two_profiles("a")
+    server = _server("x", cfg)
+    server.session = SimpleNamespace(**{
+        key: (lambda *_a, **_k: None) for key in handler_names
+    })
+    disc._adopt_server("x", server)
+    server._registered_tool_names = reg._register_server_tools("x", server, cfg)
+    names = tuple(f"mcp__x__{key}" for key in handler_names)
+    for name in names:
+        assert registry.snapshot_registration(name, scope=scope) is not None
+
+    disabled = {**cfg, "tools": {**cfg["tools"], family: False}}
+    assert reg.reapply_tool_filters({"x": disabled}) == 1
+    for name in names:
+        assert registry.snapshot_registration(name, scope=scope) is None
+    assert reg.reapply_tool_filters({"x": disabled}) == 0
+    assert reg.reapply_tool_filters({"x": cfg}) == 1
+    for name in names:
+        assert registry.snapshot_registration(name, scope=scope) is not None
